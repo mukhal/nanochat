@@ -80,127 +80,60 @@ def use_calculator(expr):
     return eval_with_timeout(expr)
 
 # -----------------------------------------------------------------------------
-## Paged Attention Engine
+class KVCache:
+    """
+    KV Cache designed for Flash Attention 3's flash_attn_with_kvcache API.
 
-class PagedKVCache:
+    Key differences from FA2-style cache:
+    - Tensors are (B, T, H, D) not (B, H, T, D)
+    - FA3 updates the cache in-place during flash_attn_with_kvcache
+    - Position tracked per batch element via cache_seqlens tensor
     """
-    Physical storage for KV cache blocks on GPU.
-    
-    This stores the actual K/V tensors in a block-organized layout.
-    The BlockManager handles logical allocation; this class handles physical storage.
-    
-    Memory layout: (num_blocks, num_layers, 2, block_size, num_heads, head_dim)
-    - num_blocks: total physical blocks available
-    - num_layers: transformer layers
-    - 2: K and V
-    - block_size: tokens per block
-    - num_heads: number of KV heads
-    - head_dim: dimension per head
-    """
-    
-    def __init__(self, num_blocks, block_size, num_layers, num_heads, head_dim, device, dtype):
-        self.num_blocks = num_blocks
-        self.block_size = block_size
-        self.num_layers = num_layers
-        self.num_heads = num_heads
+
+    def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers, device, dtype):
+        self.batch_size = batch_size
+        self.max_seq_len = seq_len
+        self.n_layers = num_layers
+        self.n_heads = num_heads
         self.head_dim = head_dim
-        self.device = device
-        self.dtype = dtype
-        
-        # Main cache storage: (num_blocks, num_layers, 2, block_size, num_heads, head_dim)
-        self.k_cache = torch.zeros(
-            num_blocks, num_layers, block_size, num_heads, head_dim,
-            device=device, dtype=dtype
-        )
-        self.v_cache = torch.zeros(
-            num_blocks, num_layers, block_size, num_heads, head_dim,
-            device=device, dtype=dtype
-        )
-        
+        # Pre-allocate cache tensors: (n_layers, B, T, H, D)
+        self.k_cache = torch.zeros(num_layers, batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
+        self.v_cache = torch.zeros(num_layers, batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
+        # Current sequence length per batch element (FA3 needs int32)
+        self.cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
+
     def reset(self):
-        """Reset cache to empty state (zero out all blocks)."""
-        self.k_cache.zero_()
-        self.v_cache.zero_()
-    
-    def get_layer_cache(self, layer_idx, block_ids):
+        """Reset cache to empty state."""
+        self.cache_seqlens.zero_()
+
+    def get_pos(self):
+        """Get current position (assumes all batch elements at same position)."""
+        return self.cache_seqlens[0].item()
+
+    def get_layer_cache(self, layer_idx):
+        """Return (k_cache, v_cache) views for a specific layer."""
+        return self.k_cache[layer_idx], self.v_cache[layer_idx]
+
+    def advance(self, num_tokens):
+        """Advance the cache position by num_tokens."""
+        self.cache_seqlens += num_tokens
+
+    def prefill(self, other):
         """
-        Get K/V cache for specific blocks at a given layer.
-        
-        Args:
-            layer_idx: which transformer layer
-            block_ids: list of physical block IDs to fetch
-            
-        Returns:
-            k: (num_blocks, block_size, num_heads, head_dim)
-            v: (num_blocks, block_size, num_heads, head_dim)
+        Copy cached KV from another cache into this one.
+        Used when we do batch=1 prefill and then want to generate multiple samples in parallel.
         """
-        k = self.k_cache[block_ids, layer_idx]  # (num_blocks, block_size, num_heads, head_dim)
-        v = self.v_cache[block_ids, layer_idx]
-        return k, v
-    
-    def write_layer_cache(self, layer_idx, block_id, slot_idx, k, v):
-        """
-        Write K/V values to a specific slot within a block.
-        
-        Args:
-            layer_idx: which transformer layer
-            block_id: physical block ID
-            slot_idx: position within the block (0 to block_size-1)
-            k: (num_heads, head_dim) or (seq_len, num_heads, head_dim)
-            v: (num_heads, head_dim) or (seq_len, num_heads, head_dim)
-        """
-        if k.dim() == 2:
-            # Single token: (num_heads, head_dim)
-            self.k_cache[block_id, layer_idx, slot_idx] = k
-            self.v_cache[block_id, layer_idx, slot_idx] = v
-        else:
-            # Multiple tokens: (seq_len, num_heads, head_dim)
-            seq_len = k.size(0)
-            self.k_cache[block_id, layer_idx, slot_idx:slot_idx + seq_len] = k
-            self.v_cache[block_id, layer_idx, slot_idx:slot_idx + seq_len] = v
-    
-    def gather_kv_for_sequence(self, layer_idx, block_table, seq_len):
-        #TODO: use flash attention with paged attention kernel 
-        """
-        Gather K/V cache for a sequence into contiguous tensors.
-        
-        This is the "gather then attend" approach - less efficient than true
-        paged attention kernels, but works with standard Flash Attention.
-        
-        Args:
-            layer_idx: which transformer layer
-            block_table: list of physical block IDs for this sequence
-            seq_len: total number of tokens to gather
-            
-        Returns:
-            k: (1, seq_len, num_heads, head_dim) - contiguous K cache
-            v: (1, seq_len, num_heads, head_dim) - contiguous V cache
-        """
-        num_full_blocks = seq_len // self.block_size
-        remainder = seq_len % self.block_size
-        
-        k_parts = []
-        v_parts = []
-        
-        # Gather full blocks
-        for i in range(num_full_blocks):
-            block_id = block_table[i]
-            k_parts.append(self.k_cache[block_id, layer_idx])  # (block_size, num_heads, head_dim)
-            v_parts.append(self.v_cache[block_id, layer_idx])
-        
-        # Gather partial last block if needed
-        if remainder > 0:
-            block_id = block_table[num_full_blocks]
-            k_parts.append(self.k_cache[block_id, layer_idx, :remainder])
-            v_parts.append(self.v_cache[block_id, layer_idx, :remainder])
-        
-        # Concatenate into contiguous tensors
-        k = torch.cat(k_parts, dim=0).unsqueeze(0)  # (1, seq_len, num_heads, head_dim)
-        v = torch.cat(v_parts, dim=0).unsqueeze(0)
-        
-        return k, v
-    
-   
+        assert self.get_pos() == 0, "Cannot prefill a non-empty KV cache"
+        assert self.n_layers == other.n_layers and self.n_heads == other.n_heads and self.head_dim == other.head_dim
+        assert self.max_seq_len >= other.max_seq_len
+        other_pos = other.get_pos()
+        self.k_cache[:, :, :other_pos, :, :] = other.k_cache[:, :, :other_pos, :, :]
+        self.v_cache[:, :, :other_pos, :, :] = other.v_cache[:, :, :other_pos, :, :]
+        self.cache_seqlens.fill_(other_pos)
+
+# -----------------------------------------------------------------------------
+
+
 @torch.inference_mode()
 def sample_next_token(logits, rng, temperature=1.0, top_k=None):
     """Sample a single next token from given logits of shape (B, vocab_size). Returns (B, 1)."""
