@@ -98,8 +98,20 @@ class CausalSelfAttention(nn.Module):
         if kv_cache is None:
             # Training: causal attention with optional sliding window
             y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        elif getattr(kv_cache, 'is_paged', False):
+            # Paged attention: gather cached k/v, concat with new, run attention, write back
+            k_cached, v_cached = kv_cache.get_layer_cache(self.layer_idx)
+            # k_cached/v_cached are (1, cached_len, H, D), k/v are (1, T, H, D)
+            k_full = torch.cat([k_cached, k], dim=1)  # (1, cached_len + T, H, D)
+            v_full = torch.cat([v_cached, v], dim=1)
+            y = flash_attn.flash_attn_func(q, k_full, v_full, causal=True, window_size=window_size)
+            # Write new k/v to the paged cache
+            kv_cache.write_kv(self.layer_idx, k, v)
+            # Advance position after last layer processes
+            if self.layer_idx == kv_cache.n_layers - 1:
+                kv_cache.advance(T)
         else:
-            # Inference: use flash_attn_with_kvcache which handles cache management
+            # Standard contiguous cache: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
             y = flash_attn.flash_attn_with_kvcache(
                 q, k_cache, v_cache,

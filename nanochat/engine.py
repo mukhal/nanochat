@@ -17,8 +17,11 @@ import signal
 import warnings
 from contextlib import contextmanager
 from collections import deque
+from typing import List, Optional
 from nanochat.common import compute_init, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
+from nanochat.block_manager import BlockManager, Sequence, SamplingParams, BLOCK_SIZE
+from nanochat.engine_standard import KVCache
 from contextlib import nullcontext
 
 # -----------------------------------------------------------------------------
@@ -160,12 +163,13 @@ class PagedKVCache:
             self.v_cache[block_id, layer_idx, slot_idx:slot_idx + seq_len] = v
     
     def gather_kv_for_sequence(self, layer_idx, block_table, seq_len):
-        #TODO: use flash attention with paged attention kernel 
         """
         Gather K/V cache for a sequence into contiguous tensors.
         
         This is the "gather then attend" approach - less efficient than true
         paged attention kernels, but works with standard Flash Attention.
+        
+        #TODO: use dedicated kernels
         
         Args:
             layer_idx: which transformer layer
@@ -200,7 +204,11 @@ class PagedKVCache:
         
         return k, v
     
-   
+    def memory_usage_bytes(self):
+        """Return total memory used by the cache in bytes."""
+        return self.k_cache.numel() * self.k_cache.element_size() * 2  # *2 for K and V
+
+
 @torch.inference_mode()
 def sample_next_token(logits, rng, temperature=1.0, top_k=None):
     """Sample a single next token from given logits of shape (B, vocab_size). Returns (B, 1)."""
@@ -219,6 +227,241 @@ def sample_next_token(logits, rng, temperature=1.0, top_k=None):
         probs = F.softmax(logits, dim=-1)
         return torch.multinomial(probs, num_samples=1, generator=rng)
 
+
+class SequenceKVView:
+    """
+    Per-sequence view into the shared PagedKVCache.
+    
+    This is a lightweight wrapper that provides the same interface as KVCache
+    but reads/writes to scattered blocks in the PagedKVCache based on the
+    sequence's block_table. 
+    
+    This is done so we don't have to modify gpt.py too much. Basically, the model's attention code doesn't need to know about paging - it just calls get_layer_cache() like before.
+    """
+    
+    def __init__(self, paged_cache: PagedKVCache, block_table: List[int], seq_len: int, block_size: int):
+        self.paged_cache = paged_cache
+        self.block_table = block_table
+        self.seq_len = seq_len  # Total tokens in sequence (prompt + generated)
+        self.cached_len = 0     # Tokens actually written to cache so far
+        self.block_size = block_size
+        self.n_layers = paged_cache.num_layers
+        self.is_paged = True  # Flag for attention code to detect paged cache
+        # cache_seqlens tracks what's in the cache (for compatibility)
+        self.cache_seqlens = torch.tensor([0], dtype=torch.int32, device=paged_cache.device)
+    
+    def get_pos(self):
+        """Get current position (number of tokens cached)."""
+        return self.cached_len
+    
+    def get_layer_cache(self, layer_idx):
+        """
+        Return (k_cache, v_cache) for a specific layer.
+        
+        Gathers scattered blocks into contiguous tensors that Flash Attention expects.
+        Returns shape (1, cached_len, num_heads, head_dim) for both K and V.
+        Only returns tokens that have actually been written to the cache.
+        """
+        if self.cached_len == 0:
+            # No cached tokens yet - return empty tensors
+            device = self.paged_cache.device
+            dtype = self.paged_cache.dtype
+            return (
+                torch.empty(1, 0, self.paged_cache.num_heads, self.paged_cache.head_dim, device=device, dtype=dtype),
+                torch.empty(1, 0, self.paged_cache.num_heads, self.paged_cache.head_dim, device=device, dtype=dtype),
+            )
+        return self.paged_cache.gather_kv_for_sequence(
+            layer_idx, self.block_table, self.cached_len
+        )
+    
+    def advance(self, num_tokens):
+        """Advance the cached length by num_tokens (called after write_kv)."""
+        self.cached_len += num_tokens
+        self.cache_seqlens[0] = self.cached_len
+    
+    def write_kv(self, layer_idx, k, v):
+        """
+        Write new K/V values to the cache at the current cached_len position.
+        
+        Args:
+            layer_idx: which transformer layer
+            k: (batch=1, num_new_tokens, num_heads, head_dim)
+            v: (batch=1, num_new_tokens, num_heads, head_dim)
+        """
+        # k, v are (1, T, H, D) - remove batch dim
+        k = k.squeeze(0)  # (T, H, D)
+        v = v.squeeze(0)
+        
+        num_new_tokens = k.size(0)
+        start_pos = self.cached_len  # Write at current cache position
+        
+        for i in range(num_new_tokens):
+            pos = start_pos + i
+            block_idx = pos // self.block_size
+            slot_idx = pos % self.block_size
+            block_id = self.block_table[block_idx]
+            
+            self.paged_cache.k_cache[block_id, layer_idx, slot_idx] = k[i]
+            self.paged_cache.v_cache[block_id, layer_idx, slot_idx] = v[i]
+
+
+# -----------------------------------------------------------------------------
+# PagedEngine: Engine with paged attention support
+
+class PagedEngine:
+    """
+    Inference engine using paged attention for memory-efficient KV caching.
+    
+    Unlike the standard Engine which allocates contiguous KV cache per request,
+    PagedEngine uses a shared PagedKVCache with block-based allocation.
+    """
+    
+    def __init__(self, model, tokenizer, num_blocks: int = 1000, block_size: int = BLOCK_SIZE):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.block_size = block_size
+        
+        # Get model config
+        m = model.config
+        device = model.get_device()
+        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        
+        # Create shared resources
+        self.paged_kv_cache = PagedKVCache(
+            num_blocks=num_blocks,
+            block_size=block_size,
+            num_layers=m.n_layer,
+            num_heads=m.n_kv_head,
+            head_dim=m.n_embd // m.n_head,
+            device=device,
+            dtype=dtype,
+        )
+        self.block_manager = BlockManager(num_blocks, block_size)
+        
+    @torch.inference_mode()
+    def generate(self, tokens: List[int], max_tokens: Optional[int] = None, 
+                 temperature: float = 1.0, top_k: Optional[int] = None, seed: int = 42):
+        """
+        Generate tokens using paged attention.
+        
+        Yields (token, mask) tuples where mask=1 for sampled tokens, mask=0 for forced tokens.
+        """
+        assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
+        device = self.model.get_device()
+        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        rng = torch.Generator(device=device)
+        rng.manual_seed(seed)
+        
+        # Get special tokens for tool use
+        get_special = lambda s: self.tokenizer.encode_special(s)
+        python_start = get_special("<|python_start|>")
+        python_end = get_special("<|python_end|>")
+        output_start = get_special("<|output_start|>")
+        output_end = get_special("<|output_end|>")
+        assistant_end = get_special("<|assistant_end|>")
+        bos = self.tokenizer.get_bos_token_id()
+        
+        # Create sequence and allocate blocks
+        seq = Sequence(tokens, SamplingParams(temperature=temperature, max_tokens=max_tokens or 256, top_k=top_k))
+        self.block_manager.allocate(seq)
+        
+        # Create KV view for this sequence
+        seq_view = SequenceKVView(
+            self.paged_kv_cache,
+            seq.block_table,
+            seq.num_tokens,
+            self.block_size,
+        )
+        
+        # Tool use state
+        forced_tokens = deque()
+        in_python_block = False
+        python_expr_tokens = []
+        
+        try:
+            # Prefill: process all prompt tokens at once
+            ids = torch.tensor([tokens], dtype=torch.long, device=device)
+            logits = self.model.forward(ids, kv_cache=seq_view)
+            logits = logits[:, -1, :]  # (1, vocab_size)
+            
+            # Decode loop
+            num_generated = 0
+            while True:
+                # Stop conditions
+                if max_tokens is not None and num_generated >= max_tokens:
+                    break
+                
+                # Sample or use forced token
+                is_forced = len(forced_tokens) > 0
+                if is_forced:
+                    next_token = forced_tokens.popleft()
+                else:
+                    next_ids = sample_next_token(logits, rng, temperature, top_k)
+                    next_token = next_ids[0, 0].item()
+                
+                # Check for completion
+                if next_token == assistant_end or next_token == bos:
+                    break
+                
+                # Update sequence
+                seq.append_token(next_token)
+                
+                # Allocate new block if needed (when current block is full)
+                if seq.num_tokens > len(seq.block_table) * self.block_size:
+                    new_block = self.block_manager._allocate_block()
+                    seq.block_table.append(new_block.block_id)
+                
+                # Handle tool logic
+                if next_token == python_start:
+                    in_python_block = True
+                    python_expr_tokens = []
+                elif next_token == python_end and in_python_block:
+                    in_python_block = False
+                    if python_expr_tokens:
+                        expr = self.tokenizer.decode(python_expr_tokens)
+                        result = use_calculator(expr)
+                        if result is not None:
+                            result_tokens = self.tokenizer.encode(str(result))
+                            forced_tokens.append(output_start)
+                            forced_tokens.extend(result_tokens)
+                            forced_tokens.append(output_end)
+                    python_expr_tokens = []
+                elif in_python_block:
+                    python_expr_tokens.append(next_token)
+                
+                # Yield token
+                yield next_token, (0 if is_forced else 1)
+                num_generated += 1
+                
+                # Forward pass for next token
+                next_ids = torch.tensor([[next_token]], dtype=torch.long, device=device)
+                logits = self.model.forward(next_ids, kv_cache=seq_view)[:, -1, :]
+                
+        finally:
+            # Always deallocate blocks when done
+            self.block_manager.deallocate(seq)
+    
+    def generate_batch(self, tokens: List[int], **kwargs):
+        """
+        Non-streaming generation that returns the final token sequence.
+        """
+        assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
+        bos = self.tokenizer.get_bos_token_id()
+        
+        result = tokens.copy()
+        masks = [0] * len(tokens)
+        
+        for token, mask in self.generate(tokens, **kwargs):
+            if token == assistant_end or token == bos:
+                break
+            result.append(token)
+            masks.append(mask)
+        
+        return result, masks
+
+
+# -----------------------------------------------------------------------------
+# Legacy Engine (uses contiguous KVCache, supports num_samples > 1)
 # -----------------------------------------------------------------------------
 
 class RowState:
@@ -230,156 +473,27 @@ class RowState:
         self.python_expr_tokens = [] # Tokens of the current python expression
         self.completed = False # Whether this row has completed generation
 
-class Engine:
-
-    def __init__(self, model, tokenizer):
-        self.model = model
-        self.tokenizer = tokenizer # needed for tool use
-
-    @torch.inference_mode()
-    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
-        """Same as generate, but does single prefill and then clones the KV cache."""
-        assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
-        device = self.model.get_device()
-        # NOTE: setting the dtype here and in this way is an ugly hack.
-        # Currently the repo assumes that cuda -> bfloat16 and everything else -> float32.
-        # We need to know the dtype here to call __init__ on KVCache and pre-allocate its tensors.
-        # As a quick hack, we're making generate() function inherit and know about this repo-wise assumption.
-        # I think there has to be a bigger refactor to deal with device/dtype tracking across the codebase.
-        # In particular, the KVCache should allocate its tensors lazily
-        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-        rng = torch.Generator(device=device)
-        rng.manual_seed(seed)
-
-        # Get the special tokens we need to coordinate the tool use state machine
-        get_special = lambda s: self.tokenizer.encode_special(s)
-        python_start = get_special("<|python_start|>")
-        python_end = get_special("<|python_end|>")
-        output_start = get_special("<|output_start|>")
-        output_end = get_special("<|output_end|>")
-        assistant_end = get_special("<|assistant_end|>") # if sampled, ends row
-        bos = self.tokenizer.get_bos_token_id() # if sampled, ends row
-
-        # 1) Run a batch 1 prefill of the prompt tokens
-        m = self.model.config
-        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
-        kv_cache_prefill = KVCache(
-            batch_size=1,
-            seq_len=len(tokens),
-            device=device,
-            dtype=dtype,
-            **kv_model_kwargs,
-        )
-        import ipdb; ipdb.set_trace()
-        ids = torch.tensor([tokens], dtype=torch.long, device=device)
-        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
-        logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
-
-        # 2) Replicate the KV cache for each sample/row
-        kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
-        kv_cache_decode = KVCache(
-            batch_size=num_samples,
-            seq_len=kv_length_hint,
-            device=device,
-            dtype=dtype,
-            **kv_model_kwargs,
-        )
-        kv_cache_decode.prefill(kv_cache_prefill)
-        del kv_cache_prefill # no need to keep this memory around
-
-        # 3) Initialize states for each sample
-        row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
-
-        # 4) Main generation loop
-        num_generated = 0
-        while True:
-            # Stop condition: we've reached max tokens
-            if max_tokens is not None and num_generated >= max_tokens:
-                break
-            # Stop condition: all rows are completed
-            if all(state.completed for state in row_states):
-                break
-
-            # Sample the next token for each row
-            next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)
-            sampled_tokens = next_ids[:, 0].tolist()
-
-            # Process each row: choose the next token, update state, optional tool use
-            token_column = [] # contains the next token id along each row
-            token_masks = [] # contains the mask (was it sampled (1) or forced (0)?) along each row
-            for i, state in enumerate(row_states):
-                # Select the next token in this row
-                is_forced = len(state.forced_tokens) > 0 # are there tokens waiting to be forced in deque?
-                token_masks.append(0 if is_forced else 1) # mask is 0 if forced, 1 if sampled
-                next_token = state.forced_tokens.popleft() if is_forced else sampled_tokens[i]
-                token_column.append(next_token)
-                # Update the state of this row to include the next token
-                state.current_tokens.append(next_token)
-                # On <|assistant_end|> or <|bos|>, mark the row as completed
-                if next_token == assistant_end or next_token == bos:
-                    state.completed = True
-                # Handle tool logic
-                if next_token == python_start:
-                    state.in_python_block = True
-                    state.python_expr_tokens = []
-                elif next_token == python_end and state.in_python_block:
-                    state.in_python_block = False
-                    if state.python_expr_tokens:
-                        expr = self.tokenizer.decode(state.python_expr_tokens)
-                        result = use_calculator(expr)
-                        if result is not None:
-                            result_tokens = self.tokenizer.encode(str(result))
-                            state.forced_tokens.append(output_start)
-                            state.forced_tokens.extend(result_tokens)
-                            state.forced_tokens.append(output_end)
-                    state.python_expr_tokens = []
-                elif state.in_python_block:
-                    state.python_expr_tokens.append(next_token)
-
-            # Yield the token column
-            yield token_column, token_masks
-            num_generated += 1
-
-            # Prepare logits for next iteration
-            ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
-            logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
-
-    def generate_batch(self, tokens, num_samples=1, **kwargs):
-        """
-        Non-streaming batch generation that just returns the final token sequences.
-        Returns a list of token sequences (list of lists of ints).
-        Terminal tokens (assistant_end, bos) are not included in the results.
-        """
-        assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
-        bos = self.tokenizer.get_bos_token_id()
-        results = [tokens.copy() for _ in range(num_samples)]
-        masks = [[0] * len(tokens) for _ in range(num_samples)]
-        completed = [False] * num_samples
-        for token_column, token_masks in self.generate(tokens, num_samples, **kwargs):
-            for i, (token, mask) in enumerate(zip(token_column, token_masks)):
-                if not completed[i]:
-                    if token == assistant_end or token == bos:
-                        completed[i] = True
-                    else:
-                        results[i].append(token)
-                        masks[i].append(mask)
-            # Stop if all rows are completed
-            if all(completed):
-                break
-        return results, masks
-
 
 if __name__ == "__main__":
     """
-    Quick inline test to make sure that the naive/slow model.generate function
-    is equivalent to the faster Engine.generate function here.
+    Test script for inference engines.
+    
+    Tests:
+    1. model.generate() - naive reference implementation
+    2. Engine.generate() - standard KV cache
+    3. PagedEngine.generate() - paged attention
+    
+    All three should produce identical outputs with the same seed.
     """
     import argparse
     import time
+    from nanochat.checkpoint_manager import build_model, find_last_step
+    
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-tag", type=str, default="d34", help="Model tag (e.g. d34)")
-    parser.add_argument("--step", type=int, default=169150, help="Checkpoint step")
-    parser.add_argument("--source", type=str, default="sft", help="Source: base|sft|rl")
+    parser.add_argument("--model-dir", type=str, default="/data2/khalifam/fun/nanochat/models/nanochat-d34", 
+                        help="Path to model directory")
+    parser.add_argument("--step", type=int, default=None, help="Checkpoint step (default: latest)")
+    parser.add_argument("--test", type=str, default="all", choices=["all", "paged"], help="Which test to run")
     args = parser.parse_args()
 
     # init compute
@@ -388,46 +502,97 @@ if __name__ == "__main__":
     autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
 
     # load the model and tokenizer
-    model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
+    step = args.step if args.step is not None else find_last_step(args.model_dir)
+    print(f"Loading model from {args.model_dir} at step {step}...")
+    model, tokenizer, meta = build_model(args.model_dir, step, device, phase="eval")
     bos_token_id = tokenizer.get_bos_token_id()
+    
     # common hyperparameters
-    kwargs = dict(max_tokens=64, temperature=0.7)
+    kwargs = dict(max_tokens=64, temperature=0.7, seed=42)
     # set the starting prompt
     prompt_tokens = tokenizer.encode("Hello, how are you?", prepend=bos_token_id)
-    # generate the reference sequence using the model.generate() function
-    generated_tokens = []
-    torch.cuda.synchronize()
+    print(f"Prompt ({len(prompt_tokens)} tokens): {tokenizer.decode(prompt_tokens)}")
+    print("=" * 60)
+
+    if args.test == "all":
+        # =========================================================================
+        # Test 1: Reference implementation (model.generate)
+        # =========================================================================
+        print("\n[1] Testing model.generate() (reference)...")
+        reference_tokens = []
+        torch.cuda.synchronize() if device_type == "cuda" else None
+        t0 = time.time()
+        stream = model.generate(prompt_tokens, max_tokens=kwargs["max_tokens"], 
+                               temperature=kwargs["temperature"], seed=kwargs["seed"])
+        with autocast_ctx:
+            for token in stream:
+                reference_tokens.append(token)
+                print(tokenizer.decode([token]), end="", flush=True)
+        print()
+        torch.cuda.synchronize() if device_type == "cuda" else None
+        t1 = time.time()
+        print(f"Reference: {len(reference_tokens)} tokens in {t1 - t0:.2f}s")
+
+        # =========================================================================
+        # Test 2: Standard Engine (contiguous KV cache)
+        # =========================================================================
+        print("\n[2] Testing Engine.generate() (standard KV cache)...")
+        engine_tokens = []
+        engine = Engine(model, tokenizer)
+        torch.cuda.synchronize() if device_type == "cuda" else None
+        t0 = time.time()
+        with autocast_ctx:
+            for token_column, token_masks in engine.generate(prompt_tokens, num_samples=1, **kwargs):
+                token = token_column[0]
+                engine_tokens.append(token)
+                print(tokenizer.decode([token]), end="", flush=True)
+        print()
+        torch.cuda.synchronize() if device_type == "cuda" else None
+        t1 = time.time()
+        print(f"Engine: {len(engine_tokens)} tokens in {t1 - t0:.2f}s")
+        
+        # Compare
+        match = reference_tokens == engine_tokens
+        print(f"Engine vs Reference: {'MATCH' if match else 'MISMATCH'}")
+        if not match:
+            for i, (r, e) in enumerate(zip(reference_tokens, engine_tokens)):
+                if r != e:
+                    print(f"  First mismatch at position {i}: ref={r} ({tokenizer.decode([r])!r}) vs engine={e} ({tokenizer.decode([e])!r})")
+                    break
+
+    # =========================================================================
+    # Test 3: PagedEngine (paged attention)
+    # =========================================================================
+    print("\n[3] Testing PagedEngine.generate() (paged attention)...")
+    paged_tokens = []
+    
+    # Calculate number of blocks needed
+    m = model.config
+    max_seq_len = len(prompt_tokens) + kwargs["max_tokens"]
+    num_blocks_needed = (max_seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE + 10  # extra buffer
+    print(f"    Block size: {BLOCK_SIZE}, allocating {num_blocks_needed} blocks")
+    
+    paged_engine = PagedEngine(model, tokenizer, num_blocks=num_blocks_needed, block_size=BLOCK_SIZE)
+    torch.cuda.synchronize() if device_type == "cuda" else None
     t0 = time.time()
-    stream = model.generate(prompt_tokens, **kwargs)
     with autocast_ctx:
-        for token in stream:
-            generated_tokens.append(token)
-            chunk = tokenizer.decode([token])
-            print(chunk, end="", flush=True)
+        for token, mask in paged_engine.generate(prompt_tokens, **kwargs):
+            paged_tokens.append(token)
+            print(tokenizer.decode([token]), end="", flush=True)
     print()
-    torch.cuda.synchronize()
+    torch.cuda.synchronize() if device_type == "cuda" else None
     t1 = time.time()
-    print(f"Reference time: {t1 - t0:.2f}s")
-    reference_ids = generated_tokens
-    # generate tokens with Engine
-    generated_tokens = []
-    engine = Engine(model, tokenizer)
-    stream = engine.generate(prompt_tokens, num_samples=1, **kwargs) # note: runs in fp32
-    torch.cuda.synchronize()
-    t0 = time.time()
-    with autocast_ctx:
-        for token_column, token_masks in stream:
-            token = token_column[0] # only print out the first row
-            generated_tokens.append(token)
-            chunk = tokenizer.decode([token])
-            print(chunk, end="", flush=True)
-    print()
-    torch.cuda.synchronize()
-    t1 = time.time()
-    print(f"Engine time: {t1 - t0:.2f}s")
-    # compare the two sequences
-    for i in range(len(reference_ids)):
-        if reference_ids[i] != generated_tokens[i]:
-            print(f"Mismatch at {i}: {reference_ids[i]} != {generated_tokens[i]}")
-            break
-    print(f"Match: {reference_ids == generated_tokens}")
+    print(f"PagedEngine: {len(paged_tokens)} tokens in {t1 - t0:.2f}s")
+    
+    if args.test == "all":
+        # Compare with reference
+        match = reference_tokens == paged_tokens
+        print(f"PagedEngine vs Reference: {'MATCH' if match else 'MISMATCH'}")
+        if not match:
+            for i, (r, p) in enumerate(zip(reference_tokens, paged_tokens)):
+                if r != p:
+                    print(f"  First mismatch at position {i}: ref={r} ({tokenizer.decode([r])!r}) vs paged={p} ({tokenizer.decode([p])!r})")
+                    break
+    
+    print("\n" + "=" * 60)
+    print("Tests complete!")
