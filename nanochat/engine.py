@@ -21,7 +21,7 @@ from typing import List, Optional
 from nanochat.common import compute_init, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
 from nanochat.block_manager import BlockManager, Sequence, SamplingParams, BLOCK_SIZE
-from nanochat.engine_standard import KVCache
+from nanochat.engine_standard import KVCache, Engine
 from contextlib import nullcontext
 
 # -----------------------------------------------------------------------------
@@ -461,6 +461,460 @@ class PagedEngine:
 
 
 # -----------------------------------------------------------------------------
+# Scheduler and LLM: vLLM-style batched inference
+# -----------------------------------------------------------------------------
+
+class Scheduler:
+    """
+    Manages sequence batching and memory allocation for efficient inference.
+    
+    The scheduler maintains two queues:
+    - waiting: sequences that need prefill (haven't started generating)
+    - running: sequences in decode phase (generating tokens one at a time)
+    
+    Each step, it decides whether to do prefill (process waiting sequences)
+    or decode (generate next token for running sequences).
+    """
+    
+    def __init__(self, block_manager: BlockManager, max_batch_size: int = 32):
+        self.block_manager = block_manager
+        self.max_batch_size = max_batch_size
+        self.waiting: List[Sequence] = []
+        self.running: List[Sequence] = []
+    
+    def add(self, seq: Sequence):
+        """Add a new sequence to the waiting queue."""
+        self.waiting.append(seq)
+    
+    def schedule(self) -> tuple:
+        """
+        Decide which sequences to run this step.
+        
+        Returns:
+            (sequences, is_prefill): List of sequences to process and whether it's prefill
+        """
+        # Priority: prefill waiting sequences first (they're blocking)
+        if self.waiting:
+            # Take sequences from waiting queue up to max_batch_size
+            batch = []
+            while self.waiting and len(batch) < self.max_batch_size:
+                seq = self.waiting.pop(0)
+                # Try to allocate blocks for this sequence
+                try:
+                    self.block_manager.allocate(seq)
+                    batch.append(seq)
+                except RuntimeError:
+                    # Out of blocks - put back in waiting and stop
+                    self.waiting.insert(0, seq)
+                    break
+            
+            if batch:
+                return batch, True  # is_prefill=True
+        
+        # No waiting sequences (or couldn't allocate) - decode running sequences
+        if self.running:
+            # Return all running sequences for decode
+            return self.running, False  # is_prefill=False
+        
+        return [], False
+    
+    def update(self, seqs: List[Sequence], new_tokens: List[int], eos_token_id: int):
+        """
+        Update sequences after a forward pass.
+        
+        Args:
+            seqs: Sequences that were processed
+            new_tokens: New token for each sequence
+            eos_token_id: Token ID that signals end of generation
+        """
+        for seq, token in zip(seqs, new_tokens):
+            seq.append_token(token)
+            
+            # Check completion conditions
+            if token == eos_token_id:
+                seq.status = SequenceStatus.FINISHED
+            elif seq.num_completion_tokens >= seq.max_tokens:
+                seq.status = SequenceStatus.FINISHED
+            
+            # Allocate new block if needed
+            if not seq.is_finished:
+                blocks_needed = seq.num_blocks
+                if blocks_needed > len(seq.block_table):
+                    try:
+                        new_block = self.block_manager._allocate_block()
+                        seq.block_table.append(new_block.block_id)
+                    except RuntimeError:
+                        # Out of blocks - mark as finished (truncated)
+                        seq.status = SequenceStatus.FINISHED
+    
+    def finish_prefill(self, seqs: List[Sequence]):
+        """Move sequences from prefill to running state."""
+        for seq in seqs:
+            seq.status = SequenceStatus.RUNNING
+            self.running.append(seq)
+    
+    def collect_finished(self) -> List[Sequence]:
+        """Remove and return finished sequences, deallocating their blocks."""
+        finished = [seq for seq in self.running if seq.is_finished]
+        self.running = [seq for seq in self.running if not seq.is_finished]
+        
+        for seq in finished:
+            self.block_manager.deallocate(seq)
+        
+        return finished
+    
+    def is_finished(self) -> bool:
+        """Check if all sequences have completed."""
+        return len(self.waiting) == 0 and len(self.running) == 0
+    
+    def num_waiting(self) -> int:
+        return len(self.waiting)
+    
+    def num_running(self) -> int:
+        return len(self.running)
+
+
+class BatchedSequenceKVView:
+    """
+    KV cache view for a batch of sequences with different lengths.
+    
+    Handles padding to create uniform tensors for batched attention.
+    """
+    
+    def __init__(self, paged_cache: PagedKVCache, sequences: List[Sequence], block_size: int):
+        self.paged_cache = paged_cache
+        self.sequences = sequences
+        self.block_size = block_size
+        self.n_layers = paged_cache.num_layers
+        self.is_paged = True
+        
+        # Track cached length per sequence
+        self.cached_lens = [0] * len(sequences)
+        
+        # For compatibility with model code
+        self.cache_seqlens = torch.zeros(len(sequences), dtype=torch.int32, device=paged_cache.device)
+    
+    def get_pos(self) -> int:
+        """Get position for rotary embeddings (use max cached length)."""
+        return max(self.cached_lens) if self.cached_lens else 0
+    
+    def get_layer_cache(self, layer_idx: int):
+        """
+        Gather and pad K/V cache for all sequences in the batch.
+        
+        Returns:
+            k: (batch_size, max_cached_len, num_heads, head_dim)
+            v: (batch_size, max_cached_len, num_heads, head_dim)
+        """
+        if all(cl == 0 for cl in self.cached_lens):
+            # No cached tokens yet
+            device = self.paged_cache.device
+            dtype = self.paged_cache.dtype
+            batch_size = len(self.sequences)
+            return (
+                torch.empty(batch_size, 0, self.paged_cache.num_heads, self.paged_cache.head_dim, device=device, dtype=dtype),
+                torch.empty(batch_size, 0, self.paged_cache.num_heads, self.paged_cache.head_dim, device=device, dtype=dtype),
+            )
+        
+        max_cached = max(self.cached_lens)
+        batch_size = len(self.sequences)
+        device = self.paged_cache.device
+        dtype = self.paged_cache.dtype
+        
+        # Pre-allocate padded tensors
+        k_batch = torch.zeros(batch_size, max_cached, self.paged_cache.num_heads, self.paged_cache.head_dim, device=device, dtype=dtype)
+        v_batch = torch.zeros(batch_size, max_cached, self.paged_cache.num_heads, self.paged_cache.head_dim, device=device, dtype=dtype)
+        
+        # Gather each sequence's cache
+        for i, (seq, cached_len) in enumerate(zip(self.sequences, self.cached_lens)):
+            if cached_len > 0:
+                k, v = self.paged_cache.gather_kv_for_sequence(layer_idx, seq.block_table, cached_len)
+                k_batch[i, :cached_len] = k.squeeze(0)
+                v_batch[i, :cached_len] = v.squeeze(0)
+        
+        return k_batch, v_batch
+    
+    def advance(self, num_tokens: int):
+        """Advance cached length for all sequences."""
+        for i in range(len(self.cached_lens)):
+            self.cached_lens[i] += num_tokens
+        self.cache_seqlens[:] = torch.tensor(self.cached_lens, dtype=torch.int32)
+    
+    def write_kv(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor):
+        """
+        Write K/V for all sequences in the batch.
+        
+        Args:
+            k: (batch_size, num_new_tokens, num_heads, head_dim)
+            v: (batch_size, num_new_tokens, num_heads, head_dim)
+        """
+        num_new_tokens = k.size(1)
+        
+        for i, (seq, cached_len) in enumerate(zip(self.sequences, self.cached_lens)):
+            k_seq = k[i]  # (num_new_tokens, num_heads, head_dim)
+            v_seq = v[i]
+            
+            for j in range(num_new_tokens):
+                pos = cached_len + j
+                block_idx = pos // self.block_size
+                slot_idx = pos % self.block_size
+                block_id = seq.block_table[block_idx]
+                
+                self.paged_cache.k_cache[block_id, layer_idx, slot_idx] = k_seq[j]
+                self.paged_cache.v_cache[block_id, layer_idx, slot_idx] = v_seq[j]
+
+
+class LLM:
+    """
+    vLLM-style interface for batched LLM inference.
+    
+    Example:
+        llm = LLM(model_path="/path/to/model")
+        outputs = llm.generate(
+            ["Hello, how are you?", "What is 2+2?"],
+            sampling_params=SamplingParams(temperature=0.7, max_tokens=100)
+        )
+        for output in outputs:
+            print(output["text"])
+    """
+    
+    def __init__(
+        self,
+        model_path: str,
+        step: Optional[int] = None,
+        device: str = "cuda",
+        num_blocks: int = 2000,
+        block_size: int = BLOCK_SIZE,
+        max_batch_size: int = 32,
+    ):
+        """
+        Initialize the LLM engine.
+        
+        Args:
+            model_path: Path to the model checkpoint directory
+            step: Checkpoint step to load (default: latest)
+            device: Device to run on ("cuda" or "cpu")
+            num_blocks: Number of KV cache blocks to allocate
+            block_size: Tokens per block
+            max_batch_size: Maximum sequences to batch together
+        """
+        from nanochat.checkpoint_manager import build_model, find_last_step
+        
+        # Load model and tokenizer
+        self.device = torch.device(device)
+        step = step if step is not None else find_last_step(model_path)
+        self.model, self.tokenizer, _ = build_model(model_path, step, self.device, phase="eval")
+        
+        # Get model config
+        m = self.model.config
+        dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
+        
+        # Create shared KV cache space across all sequences
+        self.paged_kv_cache = PagedKVCache(
+            num_blocks=num_blocks,
+            block_size=block_size,
+            num_layers=m.n_layer,
+            num_heads=m.n_kv_head,
+            head_dim=m.n_embd // m.n_head,
+            device=self.device,
+            dtype=dtype,
+        )
+        
+        # Create block manager and scheduler
+        self.block_manager = BlockManager(num_blocks, block_size)
+        self.scheduler = Scheduler(self.block_manager, max_batch_size)
+        
+        self.block_size = block_size
+        self.eos_token_id = self.tokenizer.encode_special("<|assistant_end|>")
+        
+        # For autocast
+        self.autocast_ctx = torch.amp.autocast(device_type=device, dtype=dtype) if device == "cuda" else nullcontext()
+    
+    def add_request(self, prompt, sampling_params: Optional[SamplingParams] = None):
+        """
+        Add a generation request to the scheduler.
+        
+        Args:
+            prompt: String or list of token IDs
+            sampling_params: Generation parameters
+        """
+        if sampling_params is None:
+            sampling_params = SamplingParams()
+        
+        # Tokenize if needed
+        if isinstance(prompt, str):
+            bos = self.tokenizer.get_bos_token_id()
+            tokens = self.tokenizer.encode(prompt, prepend=bos)
+        else:
+            tokens = prompt
+        
+        seq = Sequence(tokens, sampling_params)
+        self.scheduler.add(seq)
+        return seq.seq_id
+    
+    @torch.inference_mode()
+    def step(self) -> tuple:
+        """
+        Execute one generation step.
+        
+        Returns:
+            (finished_outputs, num_tokens):
+                - finished_outputs: List of (seq_id, generated_tokens) for completed sequences
+                - num_tokens: Positive for prefill tokens, negative for decode batch size
+        """
+        # Get sequences to process
+        seqs, is_prefill = self.scheduler.schedule()
+        
+        if not seqs:
+            return [], 0
+        
+        with self.autocast_ctx:
+            if is_prefill:
+                # Prefill: process full prompts
+                outputs = self._run_prefill(seqs)
+                self.scheduler.finish_prefill(seqs)
+                num_tokens = sum(seq.num_prompt_tokens for seq in seqs)
+            else:
+                # Decode: generate one token per sequence
+                outputs = self._run_decode(seqs)
+                num_tokens = -len(seqs)
+        
+        # Collect finished sequences
+        finished = self.scheduler.collect_finished()
+        finished_outputs = [(seq.seq_id, seq.completion_token_ids) for seq in finished]
+        
+        return finished_outputs, num_tokens
+    
+    def _run_prefill(self, seqs: List[Sequence]) -> List[int]:
+        """Run prefill for a batch of sequences."""
+        # For simplicity, process one at a time (can optimize later with padding)
+        new_tokens = []
+        
+        
+        print(f"Running prefill for {len(seqs)} sequences")
+        
+        ### for now, we do one sequence at a time
+        
+        for seq in seqs:
+            # Create KV view for this sequence
+            kv_view = SequenceKVView(
+                self.paged_kv_cache,
+                seq.block_table,
+                seq.num_tokens,
+                self.block_size,
+            )
+            
+            # Forward pass
+            ids = torch.tensor([seq.token_ids], dtype=torch.long, device=self.device)
+            logits = self.model.forward(ids, kv_cache=kv_view)
+            logits = logits[:, -1, :]  # (1, vocab_size)
+            
+            # Sample next token
+            rng = torch.Generator(device=self.device)
+            rng.manual_seed(42 + seq.seq_id)  # Deterministic per sequence
+            next_token = sample_next_token(logits, rng, seq.temperature, seq.top_k)
+            new_tokens.append(next_token[0, 0].item())
+            
+            # Store the kv_view for decode phase
+            seq._kv_view = kv_view
+        
+        # Update sequences with new tokens
+        self.scheduler.update(seqs, new_tokens, self.eos_token_id)
+        
+        return new_tokens
+    
+    def _run_decode(self, seqs: List[Sequence]) -> List[int]:
+        """Run decode for a batch of sequences (one token each)."""
+        new_tokens = []
+        
+        # For simplicity, process one at a time (can optimize with batching later)
+        for seq in seqs:
+            kv_view = seq._kv_view
+            
+            # Forward pass with just the last token B=1, T=1
+            last_token = seq.token_ids[-1]
+            ids = torch.tensor([[last_token]], dtype=torch.long, device=self.device)
+            logits = self.model.forward(ids, kv_cache=kv_view)[:, -1, :]
+            
+            # Sample next token
+            rng = torch.Generator(device=self.device)
+            rng.manual_seed(42 + seq.seq_id + seq.num_tokens)
+            next_token = sample_next_token(logits, rng, seq.temperature, seq.top_k)
+            new_tokens.append(next_token[0, 0].item())
+        
+        # Update sequences
+        self.scheduler.update(seqs, new_tokens, self.eos_token_id)
+        
+        return new_tokens
+    
+    def is_finished(self) -> bool:
+        """Check if all requests have completed."""
+        return self.scheduler.is_finished()
+    
+    def generate(
+        self,
+        prompts: List[str],
+        sampling_params: Optional[SamplingParams] = None,
+        use_tqdm: bool = True,
+    ) -> List[dict]:
+        """
+        Generate completions for a batch of prompts.
+        
+        Args:
+            prompts: List of prompt strings
+            sampling_params: Generation parameters (applied to all prompts)
+            use_tqdm: Whether to show progress bar
+            
+        Returns:
+            List of dicts with "text" and "token_ids" keys
+        """
+        if sampling_params is None:
+            sampling_params = SamplingParams()
+        
+        # Setup progress tracking
+        if use_tqdm:
+            try:
+                from tqdm import tqdm
+                pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
+            except ImportError:
+                use_tqdm = False
+        
+        # Add all prompts to scheduler
+        seq_ids = []
+        for prompt in prompts:
+            seq_id = self.add_request(prompt, sampling_params)
+            seq_ids.append(seq_id)
+        
+        # Collect results
+        outputs = {}
+        
+        # Main generation loop
+        while not self.is_finished():
+            finished_outputs, num_tokens = self.step()
+            
+            for seq_id, token_ids in finished_outputs:
+                outputs[seq_id] = token_ids
+                if use_tqdm:
+                    pbar.update(1)
+        
+        if use_tqdm:
+            pbar.close()
+        
+        # Sort by seq_id to match input order and decode
+        results = []
+        for seq_id in seq_ids:
+            token_ids = outputs.get(seq_id, [])
+            text = self.tokenizer.decode(token_ids)
+            results.append({"text": text, "token_ids": token_ids})
+        
+        return results
+
+
+# Import SequenceStatus for scheduler
+from nanochat.block_manager import SequenceStatus
+
+
+# -----------------------------------------------------------------------------
 # Legacy Engine (uses contiguous KVCache, supports num_samples > 1)
 # -----------------------------------------------------------------------------
 
@@ -593,6 +1047,45 @@ if __name__ == "__main__":
                 if r != p:
                     print(f"  First mismatch at position {i}: ref={r} ({tokenizer.decode([r])!r}) vs paged={p} ({tokenizer.decode([p])!r})")
                     break
+    
+    # =========================================================================
+    # Test 4: LLM class (batched inference)
+    # =========================================================================
+    print("\n[4] Testing LLM.generate() (batched inference)...")
+    
+    # Create LLM instance
+    llm = LLM(
+        model_path=args.model_dir,
+        step=step,
+        device=str(device),
+        num_blocks=200,
+        block_size=BLOCK_SIZE,
+        max_batch_size=4,
+    )
+    
+    # Test with multiple prompts
+    test_prompts = [
+        "Hello, how are you?",
+        "What is the capital of Egypt?",
+        "Explain quantum computing in simple terms.",
+    ]
+    
+    torch.cuda.synchronize() if device_type == "cuda" else None
+    t0 = time.time()
+    outputs = llm.generate(
+        test_prompts,
+        sampling_params=SamplingParams(temperature=0.7, max_tokens=32),
+        use_tqdm=True,
+    )
+    torch.cuda.synchronize() if device_type == "cuda" else None
+    t1 = time.time()
+    
+    print(f"\nLLM batched generation completed in {t1 - t0:.2f}s")
+    print("-" * 40)
+    for i, (prompt, output) in enumerate(zip(test_prompts, outputs)):
+        print(f"Prompt {i+1}: {prompt}")
+        print(f"Output {i+1}: {output['text'][:100]}...")
+        print()
     
     print("\n" + "=" * 60)
     print("Tests complete!")
